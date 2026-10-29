@@ -77,7 +77,7 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
         page.goto(notebook_url, wait_until="domcontentloaded")
 
         # Wait for NotebookLM
-        page.wait_for_url(re.compile(r"^https://notebooklm\.google\.com/"), timeout=10000)
+        page.wait_for_url(re.compile(r"^https://notebook(lm)?\.google\.com/"), timeout=10000)
 
         # Wait for query input (MCP approach)
         print("  ⏳ Waiting for query input...")
@@ -99,6 +99,45 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
         if not query_element:
             print("  ❌ Could not find query input")
             return None
+
+        # Chat history renders a few seconds after the input appears; wait for
+        # the response count to settle so history isn't mistaken for the answer
+        def count_responses():
+            counts = {}
+            for selector in RESPONSE_SELECTORS:
+                try:
+                    counts[selector] = len(page.query_selector_all(selector))
+                except:
+                    counts[selector] = 0
+            return counts
+
+        existing_counts = count_responses()
+        settle_deadline = time.time() + 15
+        stable_polls = 0
+        while time.time() < settle_deadline and stable_polls < 3:
+            time.sleep(1)
+            counts = count_responses()
+            stable_polls = stable_polls + 1 if counts == existing_counts else 0
+            existing_counts = counts
+
+        # The chat DOM isn't in chronological order, so remember every existing
+        # response and treat only unseen text as the new answer
+        existing_texts = set()
+        for selector in RESPONSE_SELECTORS:
+            try:
+                for el in page.query_selector_all(selector):
+                    existing_texts.add(el.inner_text().strip())
+            except:
+                pass
+
+        # Dismiss announcement dialogs (e.g. "what's new in Gemini Notebook")
+        # that cover the query box; Escape closes them without accepting anything
+        for _ in range(3):
+            overlay = page.query_selector(".cdk-overlay-container .cdk-overlay-pane")
+            if not overlay or not overlay.is_visible():
+                break
+            page.keyboard.press("Escape")
+            time.sleep(1)
 
         # Type question (human-like, fast)
         print("  ⏳ Typing question...")
@@ -136,10 +175,10 @@ def ask_notebooklm(question: str, notebook_url: str, headless: bool = True) -> s
             for selector in RESPONSE_SELECTORS:
                 try:
                     elements = page.query_selector_all(selector)
-                    if elements:
-                        # Get last (newest) response
-                        latest = elements[-1]
-                        text = latest.inner_text().strip()
+                    if len(elements) > existing_counts.get(selector, 0):
+                        new_texts = [t for t in (e.inner_text().strip() for e in elements)
+                                     if t and t not in existing_texts]
+                        text = new_texts[0] if new_texts else None
 
                         if text:
                             if text == last_text:
